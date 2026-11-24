@@ -5,6 +5,8 @@ from torch import nn
 
 
 class RMSNorm(nn.Module):
+    """RMS normalization for image feature maps."""
+
     def __init__(self, dim):
         super().__init__()
         self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
@@ -14,18 +16,23 @@ class RMSNorm(nn.Module):
 
 
 class SinusoidalPosEmb(nn.Module):
+    """Convert diffusion timesteps into sinusoidal feature vectors."""
+
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
 
     def forward(self, t):
-        half = self.dim // 2
-        freqs = torch.exp(torch.arange(half, device=t.device) * -(math.log(10000) / (half - 1)))
-        angles = t[:, None] * freqs[None]
-        return torch.cat((angles.sin(), angles.cos()), dim=-1)
+        half_dim = self.dim // 2
+        frequency_scale = -math.log(10000) / (half_dim - 1)
+        frequencies = torch.exp(torch.arange(half_dim, device=t.device) * frequency_scale)
+        phases = t[:, None] * frequencies[None]
+        return torch.cat((phases.sin(), phases.cos()), dim=-1)
 
 
 class Block(nn.Module):
+    """Convolution, normalization, optional conditioning, and SiLU."""
+
     def __init__(self, dim, dim_out):
         super().__init__()
         self.proj = nn.Conv2d(dim, dim_out, 3, padding=1)
@@ -40,7 +47,7 @@ class Block(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    """Two conv blocks; the time embedding scales and shifts the first one."""
+    """Two convolution blocks conditioned on the diffusion timestep."""
 
     def __init__(self, dim, dim_out, time_dim):
         super().__init__()
@@ -50,11 +57,15 @@ class ResnetBlock(nn.Module):
         self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, t):
-        scale_shift = self.mlp(t)[:, :, None, None].chunk(2, dim=1)
-        return self.block2(self.block1(x, scale_shift)) + self.res_conv(x)
+        time_scale_shift = self.mlp(t)[:, :, None, None].chunk(2, dim=1)
+        residual = self.res_conv(x)
+        x = self.block1(x, time_scale_shift)
+        return self.block2(x) + residual
 
 
 class LinearAttention(nn.Module):
+    """Memory-efficient attention over spatial positions."""
+
     def __init__(self, dim, heads=4, dim_head=32, num_mem_kv=4):
         super().__init__()
         self.heads, self.scale = heads, dim_head ** -0.5
@@ -65,18 +76,30 @@ class LinearAttention(nn.Module):
         self.to_out = nn.Sequential(nn.Conv2d(hidden, dim, 1), RMSNorm(dim))
 
     def forward(self, x):
-        b, _, h, w = x.shape
-        q, k, v = (t.reshape(b, self.heads, -1, h * w) for t in self.to_qkv(self.norm(x)).chunk(3, dim=1))
-        mk, mv = (m.expand(b, -1, -1, -1) for m in self.mem_kv)
-        k, v = torch.cat((mk, k), dim=-1), torch.cat((mv, v), dim=-1)
-        q = q.softmax(dim=-2) * self.scale
-        k = k.softmax(dim=-1)
-        context = torch.einsum("bhdn,bhen->bhde", k, v)
-        out = torch.einsum("bhde,bhdn->bhen", context, q)
-        return self.to_out(out.reshape(b, -1, h, w))
+        batch_size, _, height, width = x.shape
+        spatial_size = height * width
+        qkv = self.to_qkv(self.norm(x)).chunk(3, dim=1)
+        query, key, value = (
+            feature_map.reshape(batch_size, self.heads, -1, spatial_size)
+            for feature_map in qkv
+        )
+        memory_key, memory_value = (
+            memory.expand(batch_size, -1, -1, -1) for memory in self.mem_kv
+        )
+        key = torch.cat((memory_key, key), dim=-1)
+        value = torch.cat((memory_value, value), dim=-1)
+
+        query = query.softmax(dim=-2) * self.scale
+        key = key.softmax(dim=-1)
+        context = torch.einsum("bhdn,bhen->bhde", key, value)
+        output = torch.einsum("bhde,bhdn->bhen", context, query)
+        output = output.reshape(batch_size, -1, height, width)
+        return self.to_out(output)
 
 
 class Attention(nn.Module):
+    """Full attention over spatial positions."""
+
     def __init__(self, dim, heads=4, dim_head=32, num_mem_kv=4):
         super().__init__()
         self.heads = heads
@@ -87,13 +110,21 @@ class Attention(nn.Module):
         self.to_out = nn.Conv2d(hidden, dim, 1)
 
     def forward(self, x):
-        b, _, h, w = x.shape
-        q, k, v = (t.reshape(b, self.heads, -1, h * w).transpose(-1, -2)
-                   for t in self.to_qkv(self.norm(x)).chunk(3, dim=1))
-        mk, mv = (m.expand(b, -1, -1, -1) for m in self.mem_kv)
-        k, v = torch.cat((mk, k), dim=-2), torch.cat((mv, v), dim=-2)
-        out = F.scaled_dot_product_attention(q, k, v)
-        return self.to_out(out.transpose(-1, -2).reshape(b, -1, h, w))
+        batch_size, _, height, width = x.shape
+        spatial_size = height * width
+        qkv = self.to_qkv(self.norm(x)).chunk(3, dim=1)
+        query, key, value = (
+            feature_map.reshape(batch_size, self.heads, -1, spatial_size).transpose(-1, -2)
+            for feature_map in qkv
+        )
+        memory_key, memory_value = (
+            memory.expand(batch_size, -1, -1, -1) for memory in self.mem_kv
+        )
+        key = torch.cat((memory_key, key), dim=-2)
+        value = torch.cat((memory_value, value), dim=-2)
+        output = F.scaled_dot_product_attention(query, key, value)
+        output = output.transpose(-1, -2).reshape(batch_size, -1, height, width)
+        return self.to_out(output)
 
 
 def Downsample(dim, dim_out):
@@ -105,6 +136,7 @@ def Upsample(dim, dim_out):
 
 
 class Unet(nn.Module):
+    """U-Net that predicts the diffusion target for a noisy image."""
 
     def __init__(self, dim=64, dim_mults=(1, 2, 4, 8), channels=3):
         super().__init__()
@@ -117,26 +149,29 @@ class Unet(nn.Module):
                                       nn.Linear(time_dim, time_dim))
 
         self.downs, self.ups = nn.ModuleList(), nn.ModuleList()
-        for i, (d_in, d_out) in enumerate(in_out):
-            last = i == len(in_out) - 1
+        for stage_index, (input_dim, output_dim) in enumerate(in_out):
+            is_last_stage = stage_index == len(in_out) - 1
             self.downs.append(nn.ModuleList([
-                ResnetBlock(d_in, d_in, time_dim),
-                ResnetBlock(d_in, d_in, time_dim),
-                Attention(d_in) if last else LinearAttention(d_in),
-                nn.Conv2d(d_in, d_out, 3, padding=1) if last else Downsample(d_in, d_out),
+                ResnetBlock(input_dim, input_dim, time_dim),
+                ResnetBlock(input_dim, input_dim, time_dim),
+                Attention(input_dim) if is_last_stage else LinearAttention(input_dim),
+                nn.Conv2d(input_dim, output_dim, 3, padding=1)
+                if is_last_stage else Downsample(input_dim, output_dim),
             ]))
 
         self.mid_block1 = ResnetBlock(dims[-1], dims[-1], time_dim)
         self.mid_attn = Attention(dims[-1])
         self.mid_block2 = ResnetBlock(dims[-1], dims[-1], time_dim)
 
-        for i, (d_in, d_out) in enumerate(reversed(in_out)):
-            first, last = i == 0, i == len(in_out) - 1
+        for stage_index, (input_dim, output_dim) in enumerate(reversed(in_out)):
+            is_first_stage = stage_index == 0
+            is_last_stage = stage_index == len(in_out) - 1
             self.ups.append(nn.ModuleList([
-                ResnetBlock(d_out + d_in, d_out, time_dim),
-                ResnetBlock(d_out + d_in, d_out, time_dim),
-                Attention(d_out) if first else LinearAttention(d_out),
-                nn.Conv2d(d_out, d_in, 3, padding=1) if last else Upsample(d_out, d_in),
+                ResnetBlock(output_dim + input_dim, output_dim, time_dim),
+                ResnetBlock(output_dim + input_dim, output_dim, time_dim),
+                Attention(output_dim) if is_first_stage else LinearAttention(output_dim),
+                nn.Conv2d(output_dim, input_dim, 3, padding=1)
+                if is_last_stage else Upsample(output_dim, input_dim),
             ]))
 
         self.final_res_block = ResnetBlock(dim * 2, dim, time_dim)
@@ -144,41 +179,46 @@ class Unet(nn.Module):
 
     def forward(self, x, time):
         x = self.init_conv(x)
-        r = x.clone()
-        t = self.time_mlp(time)
-        skips = []
-        for block1, block2, attn, down in self.downs:
-            x = block1(x, t)
-            skips.append(x)
-            x = block2(x, t)
-            x = attn(x) + x
-            skips.append(x)
-            x = down(x)
+        initial_features = x.clone()
+        time_embedding = self.time_mlp(time)
+        skip_connections = []
 
-        x = self.mid_block1(x, t)
+        for first_block, second_block, attention, downsample in self.downs:
+            x = first_block(x, time_embedding)
+            skip_connections.append(x)
+            x = second_block(x, time_embedding)
+            x = attention(x) + x
+            skip_connections.append(x)
+            x = downsample(x)
+
+        x = self.mid_block1(x, time_embedding)
         x = self.mid_attn(x) + x
-        x = self.mid_block2(x, t)
+        x = self.mid_block2(x, time_embedding)
 
-        for block1, block2, attn, up in self.ups:
-            x = block1(torch.cat((x, skips.pop()), dim=1), t)
-            x = block2(torch.cat((x, skips.pop()), dim=1), t)
-            x = attn(x) + x
-            x = up(x)
+        for first_block, second_block, attention, upsample in self.ups:
+            x = first_block(torch.cat((x, skip_connections.pop()), dim=1), time_embedding)
+            x = second_block(torch.cat((x, skip_connections.pop()), dim=1), time_embedding)
+            x = attention(x) + x
+            x = upsample(x)
 
-        return self.final_conv(self.final_res_block(torch.cat((x, r), dim=1), t))
+        x = torch.cat((x, initial_features), dim=1)
+        x = self.final_res_block(x, time_embedding)
+        return self.final_conv(x)
 
 
 def cosine_alphas_cumprod(timesteps, s=0.008):
-    t = torch.linspace(0, 1, timesteps + 1, dtype=torch.float64)
-    alphas_cumprod = torch.cos((t + s) / (1 + s) * math.pi / 2) ** 2
+    normalized_time = torch.linspace(0, 1, timesteps + 1, dtype=torch.float64)
+    alphas_cumprod = torch.cos((normalized_time + s) / (1 + s) * math.pi / 2) ** 2
     alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
     betas = (1 - alphas_cumprod[1:] / alphas_cumprod[:-1]).clip(0, 0.999)
     return torch.cumprod(1 - betas, dim=0)
 
 
 class GaussianDiffusion(nn.Module):
-    """Images go in and come out in [0, 1]; internally they are scaled to [-1, 1].
+    """Train and sample a diffusion model.
 
+    Inputs and outputs use the [0, 1] range. Calculations inside the model use
+    [-1, 1].
     """
 
     def __init__(self, model, image_size, timesteps=1000, sampling_timesteps=100):
@@ -191,7 +231,7 @@ class GaussianDiffusion(nn.Module):
         for name, value in (("alphas_cumprod", alphas_cumprod),
                             ("sqrt_alphas_cumprod", alphas_cumprod.sqrt()),
                             ("sqrt_one_minus_alphas_cumprod", (1 - alphas_cumprod).sqrt()),
-                            ("loss_weight", alphas_cumprod)):  # SNR / (SNR + 1)
+                            ("loss_weight", alphas_cumprod)):  # Equivalent to SNR / (SNR + 1).
             self.register_buffer(name, value.float(), persistent=False)
 
     def load_state_dict(self, state_dict, strict=True):
@@ -202,31 +242,41 @@ class GaussianDiffusion(nn.Module):
         return buffer[t][:, None, None, None]
 
     def forward(self, images):
-        """Training loss for a batch of [0, 1] images."""
-        x0 = images * 2 - 1
-        t = torch.randint(0, self.num_timesteps, (x0.shape[0],), device=x0.device)
-        noise = torch.randn_like(x0)
-        a, s = self.coef(self.sqrt_alphas_cumprod, t), self.coef(self.sqrt_one_minus_alphas_cumprod, t)
+        """Return the training loss for a batch of images in [0, 1]."""
+        clean_images = images * 2 - 1
+        timesteps = torch.randint(
+            0, self.num_timesteps, (clean_images.shape[0],), device=clean_images.device
+        )
+        noise = torch.randn_like(clean_images)
+        signal_scale = self.coef(self.sqrt_alphas_cumprod, timesteps)
+        noise_scale = self.coef(self.sqrt_one_minus_alphas_cumprod, timesteps)
         with torch.autocast("cuda", enabled=False):
-            x_t = a * x0 + s * noise
-        v = a * noise - s * x0
-        loss = F.mse_loss(self.model(x_t, t), v, reduction="none").mean(dim=(1, 2, 3))
-        return (loss * self.loss_weight[t]).mean()
+            noisy_images = signal_scale * clean_images + noise_scale * noise
+        velocity = signal_scale * noise - noise_scale * clean_images
+        prediction = self.model(noisy_images, timesteps)
+        per_image_loss = F.mse_loss(prediction, velocity, reduction="none").mean(dim=(1, 2, 3))
+        return (per_image_loss * self.loss_weight[timesteps]).mean()
 
     @torch.inference_mode()
     def sample(self, batch_size=16):
-        """Deterministic DDIM (eta = 0) with `sampling_timesteps` steps; returns [0, 1] images."""
+        """Generate [0, 1] images with deterministic DDIM sampling."""
         device = self.alphas_cumprod.device
-        times = torch.linspace(-1, self.num_timesteps - 1, self.sampling_timesteps + 1).int().tolist()[::-1]
-        x = torch.randn(batch_size, self.model.channels, self.image_size, self.image_size, device=device)
-        for time, time_next in zip(times[:-1], times[1:]):
-            t = torch.full((batch_size,), time, device=device, dtype=torch.long)
-            a, s = self.coef(self.sqrt_alphas_cumprod, t), self.coef(self.sqrt_one_minus_alphas_cumprod, t)
-            x0 = (a * x - s * self.model(x, t)).clamp(-1, 1)
-            if time_next < 0:
-                x = x0
+        timesteps = torch.linspace(
+            -1, self.num_timesteps - 1, self.sampling_timesteps + 1
+        ).int().tolist()[::-1]
+        images = torch.randn(
+            batch_size, self.model.channels, self.image_size, self.image_size, device=device
+        )
+        for current_time, next_time in zip(timesteps[:-1], timesteps[1:]):
+            time_batch = torch.full((batch_size,), current_time, device=device, dtype=torch.long)
+            signal_scale = self.coef(self.sqrt_alphas_cumprod, time_batch)
+            noise_scale = self.coef(self.sqrt_one_minus_alphas_cumprod, time_batch)
+            velocity = self.model(images, time_batch)
+            predicted_clean = (signal_scale * images - noise_scale * velocity).clamp(-1, 1)
+            if next_time < 0:
+                images = predicted_clean
                 break
-            noise = (x - a * x0) / s
-            alpha_next = self.alphas_cumprod[time_next]
-            x = alpha_next.sqrt() * x0 + (1 - alpha_next).sqrt() * noise
-        return (x + 1) / 2
+            predicted_noise = (images - signal_scale * predicted_clean) / noise_scale
+            next_alpha = self.alphas_cumprod[next_time]
+            images = next_alpha.sqrt() * predicted_clean + (1 - next_alpha).sqrt() * predicted_noise
+        return (images + 1) / 2
